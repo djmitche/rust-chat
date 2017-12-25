@@ -7,13 +7,15 @@ extern crate tokio_service;
 
 use std::io;
 use std::str;
+use std::net::SocketAddr;
 use bytes::BytesMut;
 use futures::{future, Future, Stream, Sink};
-use tokio_core::net::TcpListener;
+use futures::sync::mpsc;
+use tokio_core::net::{TcpListener, TcpStream};
 use tokio_core::reactor::{Core, Handle};
 use tokio_io::AsyncRead;
-use tokio_io::codec::{Encoder, Decoder};
-use tokio_service::{NewService, Service};
+use tokio_io::codec::{Encoder, Decoder, Framed};
+use tokio_service::Service;
 
 // Ideas:
 //
@@ -60,57 +62,89 @@ impl Encoder for LineCodec {
 
 // ---
 
-pub struct Echo;
+pub struct ChatConnection {
+    outgoing: mpsc::UnboundedSender<String>,
+    peer: SocketAddr,
+}
 
-impl Service for Echo {
-    // These types must match the corresponding protocol types:
-    type Request = String;
-    type Response = String;
+impl ChatConnection {
+    fn new(
+        socket: TcpStream,
+        peer: SocketAddr,
+    ) -> (ChatConnection, Box<Future<Item = (), Error = ()>>) {
+        let (writer, reader) = socket.framed(LineCodec).split();
 
-    // For non-streaming protocols, service errors are always io::Error
-    type Error = io::Error;
+        // writer.send takes ownership of self until its future completes, so it's not something we
+        // can store in a struct.  Happily, futures::sync::mpsc channels can send without a Future,
+        // so we can use that as a frontend to the writer.
+        let (tx, rx) = mpsc::unbounded();
 
-    // The future for computing the response; box it for simplicity.
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+        // bind the rx end of the channel to the writer, using `fold` to transfer ownership of
+        // `writer` between the send operation fold's accumulator.
+        let writer_fut = rx.fold(writer, |writer, msg| writer.send(msg).map_err(|_| ()));
 
-    // Produce a future for computing a response from a request.
-    fn call(&self, req: Self::Request) -> Self::Future {
-        println!("echoing {:?}", req);
-        // In this case, the response is immediate.
-        Box::new(future::ok(req))
+        (
+            ChatConnection {
+                outgoing: tx,
+                peer: peer,
+            },
+            Box::new(writer_fut.map(move |_| {
+                println!("Connection from {} terminated", peer);
+                ()
+            })),
+        )
+    }
+
+    fn send<S: Into<String>>(&self, msg: S) -> Result<(), mpsc::SendError<String>> {
+        self.outgoing.unbounded_send(msg.into())
     }
 }
 
 // ---
 
-fn serve<S>(handle: Handle, s: S, port: u16) -> Box<Future<Item = (), Error = io::Error>>
-where
-    S: NewService<Request = String, Response = String, Error = io::Error> + 'static,
-{
-    let address = format!("0.0.0.0:{}", port).parse().unwrap();
-    let listener = TcpListener::bind(&address, &handle).unwrap();
-
-    let connections = listener.incoming();
-    Box::new(connections.for_each(move |(socket, _peer_addr)| {
-        let (writer, reader) = socket.framed(LineCodec).split();
-        let service = s.new_service()?;
-
-        let responses = reader.and_then(move |req| service.call(req));
-        let server = writer.send_all(responses).then(|_| Ok(()));
-        handle.spawn(server);
-
-        Ok(())
-    }))
+pub struct ChatService {
+    connections: Vec<ChatConnection>,
 }
+
+impl ChatService {
+    fn new() -> ChatService {
+        ChatService { connections: vec![] }
+    }
+
+    fn serve(mut self, handle: Handle, port: u16) -> Box<Future<Item = (), Error = io::Error>> {
+        let address = format!("0.0.0.0:{}", port).parse().unwrap();
+        let listener = TcpListener::bind(&address, &handle).unwrap();
+
+        println!("Listening on TCP port {}", port);
+
+        Box::new(listener.incoming().for_each(move |(socket, peer_addr)| {
+            println!("New connection from {}", peer_addr);
+            let (conn, fut) = ChatConnection::new(socket, peer_addr);
+
+            self.connections.push(conn);
+            handle.spawn(fut);
+
+            self.send_all(format!("{} has joined the chat", peer_addr))
+                .unwrap();
+            Ok(())
+        }))
+    }
+
+    fn send_all<S: Into<String>>(&self, msg: S) -> Result<(), mpsc::SendError<String>> {
+        let msg = msg.into();
+        for conn in &self.connections {
+            conn.send(msg.clone())?;
+        }
+        Ok(())
+    }
+}
+
 
 fn server() -> io::Result<()> {
     let mut core = Core::new()?;
+    let svc = ChatService::new();
 
-    let fut = serve(core.handle(), || Ok(Echo), 12345);
-    let fut = fut.join(serve(core.handle(), || Ok(Echo), 12346)).map(
-        |_| (),
-    );
-
+    let fut = svc.serve(core.handle(), 12345);
     core.run(fut)
 }
 
