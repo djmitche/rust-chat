@@ -116,52 +116,75 @@ impl ChatConnection {
 
 // ---
 
-fn serve(handle: Handle, port: u16) -> Box<Future<Item = (), Error = io::Error>> {
-    let address = format!("0.0.0.0:{}", port).parse().unwrap();
-    let listener = TcpListener::bind(&address, &handle).unwrap();
-
-    let connections: Rc<RefCell<Vec<ChatConnection>>> = Rc::new(RefCell::new(vec![]));
-
-    // all incoming messages will be delivered this channel.
-    let (incoming_tx, incoming_rx) = mpsc::unbounded();
-
-    // arrange to send to all on every incoming message
-    let connections2 = connections.clone();
-    let incoming_fut = incoming_rx
-        .map(move |msg: String| for conn in connections2
-            .borrow()
-            .iter()
-        {
-            println!("msg: {:?}", msg);
-            conn.send(msg.clone()).unwrap();
-        })
-        .for_each(|_| Ok(()));
-
-    println!("Listening on TCP port {}", port);
-    let listener_fut = listener
-        .incoming()
-        .for_each(move |(socket, peer_addr)| {
-            println!("New connection from {}", peer_addr);
-            let (conn, fut) = ChatConnection::new(socket, peer_addr, incoming_tx.clone());
-
-            connections.borrow_mut().push(conn);
-            handle.spawn(fut);
-
-            incoming_tx
-                .unbounded_send(format!("{}: *joined the chat*", peer_addr))
-                .unwrap();
-            Ok(())
-        })
-        .map_err(|_| ());
-
-    Box::new(listener_fut.select(incoming_fut).then(|_| Ok(())))
+struct ChatServer {
+    handle: Handle,
+    port: u16,
+    inner: Rc<RefCell<ChatServerInner>>,
 }
 
+struct ChatServerInner {
+    connections: Vec<ChatConnection>,
+}
+
+impl ChatServer {
+    fn new(handle: Handle, port: u16) -> ChatServer {
+        ChatServer {
+            handle: handle,
+            port: port,
+            inner: Rc::new(RefCell::new(ChatServerInner { connections: vec![] })),
+        }
+    }
+
+    fn serve(self) -> Box<Future<Item = (), Error = io::Error>> {
+        let address = format!("0.0.0.0:{}", self.port).parse().unwrap();
+        let listener = TcpListener::bind(&address, &self.handle).unwrap();
+
+        // all incoming messages will be delivered this channel.
+        let (incoming_tx, incoming_rx) = mpsc::unbounded();
+
+        // arrange to send to all on every incoming message
+        let inner2 = self.inner.clone();
+        let incoming_fut = incoming_rx
+            .map(move |msg: String| for conn in inner2
+                .borrow()
+                .connections
+                .iter()
+            {
+                println!("msg: {:?}", msg);
+                conn.send(msg.clone()).unwrap();
+            })
+            .for_each(|_| Ok(()));
+
+        println!("Listening on TCP port {}", self.port);
+        let listener_fut = listener
+            .incoming()
+            .for_each(move |(socket, peer_addr)| {
+                println!("New connection from {}", peer_addr);
+                let (conn, fut) = ChatConnection::new(socket, peer_addr, incoming_tx.clone());
+
+                self.inner.borrow_mut().connections.push(conn);
+                self.handle.spawn(fut);
+
+                incoming_tx
+                    .unbounded_send(format!("{}: *joined the chat*", peer_addr))
+                    .unwrap();
+                Ok(())
+            })
+            .map_err(|_| ());
+
+        Box::new(listener_fut.select(incoming_fut).then(|_| Ok(())))
+    }
+}
+
+impl ChatServerInner {}
+
+// ---
 
 fn server() -> io::Result<()> {
     let mut core = Core::new()?;
+    let chatserver = ChatServer::new(core.handle(), 12345);
 
-    let fut = serve(core.handle(), 12345);
+    let fut = chatserver.serve();
     core.run(fut)
 }
 
